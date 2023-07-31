@@ -1,0 +1,283 @@
+#新的想法是自动调参给一个还行的超参数，
+#CV筛选一些反复出现的特征，建立每一个函数对应的数据集
+#最后一次来调参，评价最后每个函数的特征
+#随机森林rf单独列出来，因为自动调参嵌套自动特征筛选会导致报错
+#具体的函数为logreg, knn, lda, nb, rpart, rf, xgb, svm
+#其中不需要进入最后调参的函数为logreg, lda, nb
+library(mlr3)
+library(mlr3viz)
+library(mlr3verse)
+library(mlr3learners)
+library(mlr3extralearners)
+library(survival)
+library(survminer)
+library(dplyr)
+library(tidyr)
+library(caret)
+library(ggplot2)
+library(mlr3tuning)
+library(mlr3fselect)
+library(kknn)
+set.seed(123)
+#减少记录器的冗长性
+lgr::get_logger("mlr3")$set_threshold("warn")
+lgr::get_logger("bbotk")$set_threshold("warn")
+##读取数据
+Data <- read.csv(file = "C:/Users/钟艺/Desktop/A/rm_batch/data.par.csv",
+                 row.names = 1,check.names = FALSE)
+##数据预处理
+#（1）这一步使得列名符合R变量命名规则，从而可用于mlr3
+colnames(Data) <- make.names(colnames(Data))
+#去掉PFS的数据
+DATA_pre <- Data[,-1]
+
+#（2）连续变量的标准化
+po_scale = po("scale")
+po_scale$param_set$values$affect_columns =
+  selector_name(colnames(DATA_pre)[-1])
+#缩放任务
+task_process= as_task_classif(DATA_pre, target = "Group", positive = "1")
+#已缩放数据
+DATA_scale= po_scale$train(list(task_process))[[1]]$data()
+#相关性检验
+descrCor <- cor(DATA_scale[,-1])
+HCor <- findCorrelation(descrCor,cutoff=.7,names=F,verbose=T)
+HCor <- HCor+1
+DATA <- as.data.frame(DATA_scale)[,-HCor]
+
+
+
+
+#最终任务
+task= as_task_classif(DATA, target = "Group", positive = "1")
+
+
+# 5-fold cross-validation for the outer resampling method
+resampling_outer = rsmp(id = "cv", .key = "cv", folds = 5L)
+# Stratification分层采样
+task$col_roles$stratum = task$target_names
+#随机森林
+
+#算法
+pre_logreg = lrn("classif.log_reg", predict_type = "prob",
+             predict_sets = c("train", "test"))
+pre_knn = lrn("classif.kknn", scale = FALSE,
+          predict_type = "prob",
+          predict_sets = c("train", "test"))
+pre_lda = lrn("classif.lda", predict_type = "prob",
+          predict_sets = c("train", "test"))
+pre_nb = lrn("classif.naive_bayes", predict_type = "prob",
+         predict_sets = c("train", "test"))
+pre_rpart = lrn("classif.rpart",predict_type = "prob",
+            predict_sets = c("train", "test"))
+#pre_rf = lrn("classif.ranger", predict_type = "prob",
+        # predict_sets = c("train", "test"))
+pre_xgb = lrn("classif.xgboost",predict_type="prob",
+          predict_sets = c("train", "test"))
+pre_svm = lrn("classif.svm", predict_type="prob",
+          predict_sets = c("train", "test"))
+
+# 设置参数空间
+tune_ps_knn = ps(
+  k = p_int(lower = 3, upper = 20), # Number of neighbors considered
+  distance = p_dbl(lower = 1, upper = 3),
+  kernel = p_fct(levels = c("rectangular", "gaussian", "rank", "optimal"))
+)
+tune_ps_rpart = ps(
+  # Minimum number of observations that must exist in a node in order for a
+  # split to be attempted
+  minsplit = p_int(lower = 10, upper = 40),
+  cp = p_dbl(lower = 0.001, upper = 0.1) # Complexity parameter
+)
+#tune_ps_rf = ps(
+  # Minimum size of terminal nodes
+ # min.node.size = p_int(lower = 10, upper = 50),
+  # Number of variables randomly sampled as candidates at each split
+  #mtry = p_int(lower = 1, upper = 6),
+  # Number of trees
+ # num.trees = p_int(lower=1,upper=1000)
+#)
+tune_ps_xgb =ps(
+  eta = p_dbl(lower=0,upper=1),
+  gamma = p_dbl(lower=1,upper=5),
+  max_depth = p_int(lower = 1, upper = 10),
+  min_child_weight = p_dbl(lower = 1, upper = 10),
+  subsample = p_dbl(lower = 0.5, upper = 1),
+  colsample_bytree = p_dbl(lower = 0.5, upper = 1),
+  nrounds = p_int(lower = 1, upper = 50)
+)
+tune_ps_svm = ps(
+  cost = p_dbl(lower=0.1,upper=10), 
+  kernel = p_fct(c("polynomial", "radial", "sigmoid")),
+  degree = p_int(1, 3, depends = kernel == "polynomial"), # 设置参数依赖
+  gamma = p_dbl(lower=0.1,upper=10),
+  type = p_fct("C-classification")
+)
+#自动超参
+at_knn = auto_tuner(
+  tuner = tnr("random_search"),
+  learner = pre_knn,
+  resampling = rsmp("cv", folds = 5L),
+  measure = msr("classif.auc"),
+  search_space = tune_ps_knn,
+  term_evals = 10,
+)
+at_rpart= auto_tuner(
+  tuner = tnr("random_search"),
+  learner = pre_rpart,
+  resampling = rsmp("cv", folds = 5L),
+  measure = msr("classif.auc"),
+  search_space = tune_ps_rpart,
+  term_evals = 10,
+)
+#at_rf= auto_tuner(
+ # tuner = tnr("random_search"),
+ # learner = pre_rf,
+ # resampling = rsmp("cv", folds = 5L),
+ # measure = msr("classif.auc"),
+ # search_space = tune_ps_rf,
+ # term_evals = 10,
+#)
+at_xgb = auto_tuner(
+  tuner = tnr("random_search"),
+  learner = pre_xgb,
+  resampling = rsmp("cv", folds = 5L),
+  measure = msr("classif.auc"),
+  search_space = tune_ps_xgb,
+  term_evals = 10,
+)
+at_svm = auto_tuner(
+  tuner = tnr("random_search"),
+  learner = pre_svm,
+  resampling = rsmp("cv", folds = 5L),
+  measure = msr("classif.auc"),
+  search_space = tune_ps_svm,
+  term_evals = 10,
+)
+# 3-fold cross-validation for the inner loop of the nested resampling
+#嵌套重抽样概念：https://zhuanlan.zhihu.com/p/590363796
+#这里是内层(对非测试集)3折分层CV重抽样，生成不同的内层训练集与验证集
+#使用内层数据调参与筛选特征，下列代码迭代了term_eval次
+logreg = auto_fselector(
+  fselector = fs("random_search"),
+  learner = pre_logreg,
+  resampling = rsmp("cv", folds = 3L),
+  measure = msr("classif.auc"),
+  term_evals = 10000
+)
+knn= auto_fselector(
+  fselector = fs("random_search"),
+  learner = at_knn,
+  resampling = rsmp("cv", folds = 3L),
+  measure = msr("classif.auc"),
+  term_evals = 10000
+)
+lda = auto_fselector(
+  fselector = fs("random_search"),
+  learner = pre_lda,
+  resampling = rsmp("cv", folds = 3L),
+  measure = msr("classif.auc"),
+  term_evals = 10000
+)
+nb = auto_fselector(
+  fselector = fs("random_search"),
+  learner = pre_lda,
+  resampling = rsmp("cv", folds = 3L),
+  measure = msr("classif.auc"),
+  term_evals = 10000
+)
+rpart = auto_fselector(
+  fselector = fs("random_search"),
+  learner = at_rpart,
+  resampling = rsmp("cv", folds = 3L),
+  measure = msr("classif.auc"),
+  term_evals = 10000
+)
+#rf = auto_fselector(
+ # fselector = fs("random_search"),
+  #learner = at_rf,
+  #resampling = rsmp("cv", folds = 3L),
+  #measure = msr("classif.auc"),
+  #term_evals = 10
+#)
+xgb = auto_fselector(
+  fselector = fs("random_search"),
+  learner = at_xgb,
+  resampling = rsmp("cv", folds = 3L),
+  measure = msr("classif.auc"),
+  term_evals = 10000
+)
+svm = auto_fselector(
+  fselector = fs("random_search"),
+  learner = at_svm,
+  resampling = rsmp("cv", folds = 3L),
+  measure = msr("classif.auc"),
+  term_evals = 10000
+)
+
+
+logreg$predict_sets = c("train", "test")
+knn$predict_sets = c("train", "test")
+lda$predict_sets = c("train", "test")
+nb$predict_sets = c("train", "test")
+rpart$predict_sets = c("train", "test")
+#rf$predict_sets = c("train", "test")
+xgb$predict_sets = c("train", "test")
+svm$predict_sets = c("train", "test")
+# 开启外层分层CV，从而引发内层分层CV
+# 外层抽样的5折每一折都以内层获得的超参数与特征拟合学习器，获得在外层测试集上的性能
+# 最后获得的是一份无偏的性能统计
+rr_logreg = resample(task, logreg, resampling_outer, store_models = TRUE)
+rr_knn = resample(task, knn, resampling_outer, store_models = TRUE)
+rr_lda=resample(task, lda, resampling_outer, store_models = TRUE)
+rr_nb=resample(task, nb, resampling_outer, store_models = TRUE)
+rr_rpart=resample(task, rpart, resampling_outer, store_models = TRUE)
+#rr_rf=resample(task, rf, resampling_outer, store_models = TRUE)
+rr_xgb=resample(task, xgb, resampling_outer, store_models = TRUE)
+rr_svm=resample(task, svm, resampling_outer, store_models = TRUE)
+#当然，到这里可以用benchmark直接比较各个模型
+
+#提取特征
+logreg_features <- extract_inner_fselect_results(rr_logreg)
+logreg_f_features <- logreg_features$features#[which.max(logreg_features$classif.auc)]
+knn_features <- extract_inner_fselect_results(rr_knn)
+knn_f_features <- knn_features$features
+lda_features <- extract_inner_fselect_results(rr_lda)
+lda_f_features <- lda_features$features
+nb_features <-  extract_inner_fselect_results(rr_nb)
+nb_f_features <- nb_features$features
+rpart_features <- extract_inner_fselect_results(rr_rpart)
+rpart_f_features <- rpart_features$features
+#rf_features <- extract_inner_fselect_results(rr_rf)
+#rf_f_features <- rf_features$features
+xgb_features <- extract_inner_fselect_results(rr_xgb)
+xgb_f_features <- xgb_features$features
+svm_features <- extract_inner_fselect_results(rr_svm)
+svm_f_features <- svm_features$features
+
+#
+#精细搜索超参数
+
+#提取超参数
+knn_hyperparameters <- extract_inner_tuning_results(rr_knn)
+knn_hyperparameters
+#得到模型的平均表现
+design = benchmark_grid(
+  tasks = task,
+  learners = list(logreg, knn, lda, nb, rpart, xgb, svm),
+  resamplings = resampling_outer
+)
+bmr = benchmark(design, store_models = FALSE) 
+measures = list(
+  msr("classif.auc", predict_sets = "train", id = "auc_train"),
+  msr("classif.auc", id = "auc_test")
+)
+tab = bmr$aggregate(measures)
+tab_1 = tab[,c('learner_id','auc_train','auc_test')]
+tab_1
+#查看模型平均表现，并查看最佳的模型对应筛出的特征与超参数
+#看看高频率的特征与超参数
+#特征应用于生物学原理，超参数则解释为什么该类模型最适用于脂质组学分析建模
+#我的流程的优点在于嵌套重采样
+#规避了信息泄露，得到了无偏差的模型估计的同时，完成了特征筛选与调参
+#评估了多种分类模型的平均表现，为通过脂质组学进行疾病分型提供了参考
